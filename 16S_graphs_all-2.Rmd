@@ -1,0 +1,1428 @@
+---
+title: "16S Metagenomic Analysis - Enhanced Visualizations with Read Count Heatmaps"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 12,
+  fig.height = 8,
+  dpi = 600
+)
+```
+
+# Overview
+
+This R Markdown document performs 16S rRNA gene amplicon sequencing visualization with:
+
+- **Faceted plots** for before/after depletion comparisons
+- **Full sample names** on x-axis
+- **Complete relative abundance** (100% bars with single "Other" block at bottom)
+- **Read count heatmap strip** at the bottom of each plot
+- **Time-ordered enrichment plots** grouped by broth type
+- **Publication-quality** figures with consistent color schemes
+
+---
+
+# Load Required Libraries
+
+```{r load-libraries}
+library(phyloseq)
+library(dada2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readxl)
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(patchwork)
+library(pheatmap)
+library(cowplot)
+library(rlang)
+
+cat("✓ Packages loaded\n")
+```
+
+---
+
+# Define Color Palettes
+
+```{r define-color-palettes}
+# Category colors for sample metadata
+category_colors <- c(
+  "Enrichment Testing" = "#e74c3c",
+  "Host-DNA depletion" = "#3498db",
+  "Filtration testing for Host-DNA depletion" = "#2ecc71",
+  "Host-DNA depletion - enriched samples" = "#f39c12",
+  "DNA extraction kit testing" = "#9b59b6",
+  "Control" = "#95a5a6"
+)
+
+# Read count heatmap gradient (warm yellow-orange-red)
+read_count_colors <- c("#fff7ec", "#fee8c8", "#fdd49e", "#fdbb84", 
+                       "#fc8d59", "#ef6548", "#d7301f", "#990000")
+
+# Heatmap colors for abundance (warm palette)
+abundance_heatmap_colors <- c("white", "#ffeda0", "#fed976", "#feb24c", 
+                               "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+# ============================================================================
+# CONSISTENT COLOR PALETTE SYSTEM
+# ============================================================================
+# Using ColorBrewer "Set3" palette for taxa
+# Campylobacter manually assigned to green
+# Other and Unclassified are GREY
+
+# Fixed colors for special taxa
+FIXED_TAXA_COLORS <- c(
+  "Campylobacteraceae" = "#66C2A5",
+  "Campylobacter" = "#66C2A5"
+)
+
+# Official ColorBrewer Set3 palette (12 colors)
+# Removed the grey (#D9D9D9) to avoid confusion with Other/Unclassified
+SET3_PALETTE <- c(
+  "#A6CEE3",
+  "#1F78B4",
+  "#B2DF8A",
+  "#33A02C",
+  "#FB9A99",
+  "#ff5d52",
+  "#FDBF6F",
+  "#FF7F00",
+  "#CAB2D6",
+  "#6A3D9A",
+  "#B3CDE3",
+  "#B15928"
+)
+
+
+# Function to get consistent color for a taxon
+get_taxon_color <- function(taxon_name) {
+  # Check if taxon has a fixed color (Campylobacter)
+  if (taxon_name %in% names(FIXED_TAXA_COLORS)) {
+    return(FIXED_TAXA_COLORS[[taxon_name]])
+  }
+  
+  # For other taxa, assign from Set3 palette based on name hash
+  hash_val <- (sum(utf8ToInt(taxon_name)) %% length(SET3_PALETTE)) + 1
+  return(SET3_PALETTE[hash_val])
+}
+
+# Helper function to create color palette with consistent colors
+create_color_palette <- function(top_taxa) {
+  # Get colors for each taxon
+  taxa_colors <- sapply(top_taxa, get_taxon_color)
+  
+  # Check for duplicate colors and reassign if needed
+  used_colors <- c()
+  for (i in seq_along(taxa_colors)) {
+    if (taxa_colors[i] %in% used_colors) {
+      available <- setdiff(SET3_PALETTE, used_colors)
+      if (length(available) > 0) {
+        taxa_colors[i] <- available[1]
+      }
+    }
+    used_colors <- c(used_colors, taxa_colors[i])
+  }
+  
+  # Order: Other (light grey), Unclassified (medium grey), then top taxa
+  all_cols <- c(
+    "Other" = "#C0C0C0",
+    "Unclassified" = "#808080",
+    taxa_colors
+  )
+  
+  return(all_cols)
+}
+
+cat("✓ Color palettes defined\n")
+```
+
+---
+
+# Setup Sample Data
+
+```{r setup-sample-data}
+cat("Current phyloseq object:\n")
+print(ps)
+
+# Load DADA2 track data
+track_df <- as.data.frame(track)
+track_df$Sample <- rownames(track_df)
+
+# Load sample metadata
+sample_metadata <- read_excel(
+  "/nesi/nobackup/massey04083/method_development_chapter1/16S_Sequencing/16S samples - sample descriptions.xlsx"
+)
+
+# Merge and prepare metadata
+merged_data <- track_df %>%
+  left_join(sample_metadata, by = c("Sample" = "Sample code")) %>%
+  mutate(
+    Method_Category = `Method development section`,
+    Full_Name = `Full sample name`,
+    DNA_Conc = as.numeric(gsub("Too Low", NA, gsub(" ", "", `Concentration (ng/ul)`))),
+    input_reads = input,
+    filtered_reads = filtered,
+    merged_reads = merged,
+    nonchim_reads = nonchim
+  )
+
+# Align with phyloseq sample order
+rownames(merged_data) <- merged_data$Sample
+merged_data <- merged_data[sample_names(ps), , drop = FALSE]
+sample_data(ps) <- sample_data(merged_data)
+
+cat("✓ Sample data integrated\n")
+```
+
+---
+
+# Fix Metadata Issues
+
+```{r fix-metadata-REQUIRED}
+cat("=== FIXING METADATA ISSUES ===\n\n")
+
+# Remove Undetermined samples
+if ("Undetermined" %in% sample_names(ps)) {
+  ps <- prune_samples(sample_names(ps) != "Undetermined", ps)
+  cat("✓ Removed 'Undetermined' sample\n")
+}
+
+samp_df <- data.frame(sample_data(ps), stringsAsFactors = FALSE, check.names = FALSE)
+
+# Fix QDneasy samples
+qd_samples <- c("QDnBT1", "QDnBT2", "QDnBT3")
+for (i in seq_along(qd_samples)) {
+  if (qd_samples[i] %in% rownames(samp_df)) {
+    samp_df[qd_samples[i], "Method_Category"] <- "DNA extraction kit testing"
+    if ("Full_Name" %in% colnames(samp_df)) {
+      samp_df[qd_samples[i], "Full_Name"] <- paste0("QDneasy Blood Tissue Kit Rep", i)
+    }
+  }
+}
+
+# Create display names
+samp_df$Full_Name_Display <- NA_character_
+
+for (i in seq_len(nrow(samp_df))) {
+  sample_code <- rownames(samp_df)[i]
+  full_name <- if ("Full_Name" %in% colnames(samp_df)) samp_df[i, "Full_Name"] else NA
+
+  if (is.na(full_name) || full_name == "") {
+    samp_df$Full_Name_Display[i] <- sample_code
+  } else {
+    samp_df$Full_Name_Display[i] <- paste0(full_name, " [", sample_code, "]")
+  }
+}
+
+sample_data(ps) <- sample_data(samp_df)
+
+cat("\n✓ Verification:\n")
+cat("  Missing Method_Category:", sum(is.na(samp_df$Method_Category)), "\n")
+cat("  Missing nonchim_reads:", sum(is.na(samp_df$nonchim_reads)), "\n")
+cat("  Duplicate Full_Name_Display:", sum(duplicated(samp_df$Full_Name_Display)), "\n")
+cat("\nSample categories:\n")
+print(table(sample_data(ps)$Method_Category, useNA = "ifany"))
+cat("\n✓ Metadata fix complete!\n")
+```
+
+---
+
+# Add Enrichment Metadata and Taxonomy Aggregation
+
+```{r enrichment-and-tax-setup}
+samp_df <- data.frame(sample_data(ps), stringsAsFactors = FALSE, check.names = FALSE)
+
+# Extract broth type
+samp_df$Broth_Type <- dplyr::case_when(
+  str_detect(samp_df$Full_Name_Display, regex("CAT", ignore_case = TRUE)) &
+    str_detect(samp_df$Full_Name_Display, regex("Bolton|BFBB|BF\\s*Bolton", ignore_case = TRUE)) ~ "BF Bolton + CAT",
+  str_detect(samp_df$Full_Name_Display, regex("Bolton|BFBB|BF\\s*Bolton", ignore_case = TRUE)) ~ "BF Bolton",
+  str_detect(samp_df$Full_Name_Display, regex("\\bRVS\\b", ignore_case = TRUE)) ~ "RVS",
+  str_detect(samp_df$Full_Name_Display, regex("\\bBPW\\b", ignore_case = TRUE)) ~ "BPW",
+  TRUE ~ NA_character_
+)
+
+# Extract incubation time
+samp_df$Incubation_hr <- as.numeric(str_extract(samp_df$Full_Name_Display, "(?i)\\d+(?=\\s*h)"))
+
+sample_data(ps) <- sample_data(samp_df)
+
+cat("✓ Added Broth_Type + Incubation_hr\n")
+print(table(sample_data(ps)$Broth_Type, useNA = "ifany"))
+print(summary(sample_data(ps)$Incubation_hr))
+
+# Taxonomic aggregation (NArm=FALSE keeps Unclassified taxa)
+ps_family <- tax_glom(ps, taxrank = "Family", NArm = FALSE)
+ps_genus  <- tax_glom(ps, taxrank = "Genus",  NArm = FALSE)
+
+# ENFORCED compositional transformation (guarantees sum = 1 per sample)
+ps_family_rel <- transform_sample_counts(ps_family, function(x) {
+  total <- sum(x, na.rm = TRUE)
+  if (total > 0) x / total else x
+})
+
+ps_genus_rel <- transform_sample_counts(ps_genus, function(x) {
+  total <- sum(x, na.rm = TRUE)
+  if (total > 0) x / total else x
+})
+
+cat("✓ Taxonomic aggregations complete (Unclassified retained)\n")
+
+# Verify closure
+cat("\nPost-transformation sample sums (Family):\n")
+print(summary(sample_sums(ps_family_rel)))
+cat("\nPost-transformation sample sums (Genus):\n")
+print(summary(sample_sums(ps_genus_rel)))
+```
+
+---
+
+# Define Plotting Functions
+
+```{r define-plotting-functions}
+# ============================================================
+# PLOTTING FUNCTIONS (CLEAN + FIXED + ADDED NO-FILTER PANEL)
+# - guarantees bars sum to 100% via renormalization
+# - preserves real "Other" (no remainder/diff hacks)
+# - NEW: create_triple_faceted_plot for unfiltered + filtered views
+# ============================================================
+
+normalize_composition_by_sample <- function(df, sample_col = "Sample", abundance_col = "Abundance") {
+  sample_sym <- rlang::sym(sample_col)
+  abund_sym  <- rlang::sym(abundance_col)
+
+  df %>%
+    dplyr::mutate(!!abund_sym := pmax(0, !!abund_sym)) %>%
+    dplyr::group_by(!!sample_sym) %>%
+    dplyr::mutate(
+      .total = sum(!!abund_sym, na.rm = TRUE),
+      !!abund_sym := dplyr::if_else(.total > 0, (!!abund_sym) / .total, 0)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-.total)
+}
+
+# NEW FUNCTION: Three-panel plot (All samples + Host-Depleted + No Host-Depletion)
+create_triple_faceted_plot <- function(physeq,
+                                       sample_filter = NULL,
+                                       title = "Microbial Composition - Complete Overview",
+                                       output_file = NULL,
+                                       top_n = 12,
+                                       taxon_rank = "Family",
+                                       width = 20,
+                                       height = 11) {
+
+  if (!is.null(sample_filter) && "Method_Category" %in% colnames(sample_data(physeq))) {
+    physeq <- prune_samples(sample_data(physeq)$Method_Category %in% sample_filter, physeq)
+  }
+  if (nsamples(physeq) == 0) {
+    warning("No samples found after filtering")
+    return(NULL)
+  }
+
+  plot_df <- psmelt(physeq)
+  if ("sample_Sample" %in% colnames(plot_df) && !"Sample" %in% colnames(plot_df)) {
+    plot_df$Sample <- plot_df$sample_Sample
+  }
+
+  plot_df$Taxon <- plot_df[[taxon_rank]]
+  plot_df$Taxon[is.na(plot_df$Taxon) | plot_df$Taxon == ""] <- "Unclassified"
+
+  top_taxa <- plot_df %>%
+    dplyr::filter(Taxon != "Unclassified") %>%
+    dplyr::group_by(Taxon) %>%
+    dplyr::summarise(Total = sum(Abundance), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(Total)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::pull(Taxon)
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(Taxon_Display = dplyr::case_when(
+      Taxon == "Unclassified" ~ "Unclassified",
+      Taxon %in% top_taxa ~ Taxon,
+      TRUE ~ "Other"
+    ))
+
+  plot_df_agg <- plot_df %>%
+    dplyr::group_by(Sample, Taxon_Display) %>%
+    dplyr::summarise(
+      Abundance = sum(Abundance, na.rm = TRUE),
+      Full_Name_Display = dplyr::first(Full_Name_Display),
+      Method_Category   = dplyr::first(Method_Category),
+      nonchim_reads     = dplyr::first(nonchim_reads),
+      .groups = "drop"
+    )
+
+  plot_df_agg <- normalize_composition_by_sample(plot_df_agg, sample_col = "Sample", abundance_col = "Abundance")
+  
+  # Safety: ensure no NA/negative values before plotting
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::filter(!is.na(Abundance), Abundance >= 0) %>%
+    dplyr::mutate(Abundance = pmax(Abundance, 1e-10))
+
+  # Create depletion status
+  plot_df_agg$Depletion_Status <- ifelse(
+    grepl("No host|No Host", plot_df_agg$Full_Name_Display, ignore.case = TRUE),
+    "No Host-Depletion",
+    "With Host-Depletion"
+  )
+
+  # Create three datasets: All, No Host-Depletion, With Host-Depletion
+  plot_df_all <- plot_df_agg %>%
+    dplyr::mutate(Panel = "All Samples")
+  
+  plot_df_no_host <- plot_df_agg %>%
+    dplyr::filter(Depletion_Status == "No Host-Depletion") %>%
+    dplyr::mutate(Panel = "No Host-Depletion")
+  
+  plot_df_with_host <- plot_df_agg %>%
+    dplyr::filter(Depletion_Status == "With Host-Depletion") %>%
+    dplyr::mutate(Panel = "With Host-Depletion")
+  
+  # Combine all three
+  plot_df_combined <- dplyr::bind_rows(plot_df_all, plot_df_no_host, plot_df_with_host)
+  
+  # Set panel order
+  plot_df_combined$Panel <- factor(
+    plot_df_combined$Panel, 
+    levels = c("All Samples", "No Host-Depletion", "With Host-Depletion")
+  )
+
+  plot_df_combined$Sample_Label <- plot_df_combined$Full_Name_Display
+
+  # Order samples within each panel
+  plot_df_combined <- plot_df_combined %>%
+    dplyr::arrange(Panel, Depletion_Status, Sample) %>%
+    dplyr::group_by(Panel) %>%
+    dplyr::mutate(Sample_Label = factor(Sample_Label, levels = unique(Sample_Label))) %>%
+    dplyr::ungroup()
+
+  taxa_order <- c("Other", "Unclassified", top_taxa)
+  plot_df_combined$Taxon_Display <- factor(plot_df_combined$Taxon_Display, levels = taxa_order)
+
+  cols <- create_color_palette(top_taxa)
+
+  p_bar <- ggplot(plot_df_combined, aes(x = Sample_Label, y = Abundance * 100, fill = Taxon_Display)) +
+    geom_bar(stat = "identity", color = "white", linewidth = 0.2) +
+    scale_fill_manual(values = cols, name = taxon_rank, drop = FALSE) +
+    facet_wrap(~Panel, scales = "free_x", ncol = 3) +
+    labs(y = "Relative Abundance (%)", x = "", title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      strip.background = element_rect(fill = "grey90", color = "black"),
+      strip.text = element_text(face = "bold", size = 12),
+      panel.grid.major.y = element_line(color = "grey90"),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.margin = margin(5, 5, 0, 5)
+    ) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 100.1))
+
+  read_df <- plot_df_combined %>% dplyr::distinct(Sample_Label, Panel, nonchim_reads)
+  max_reads <- max(read_df$nonchim_reads, na.rm = TRUE)
+
+  p_heat <- ggplot(read_df, aes(x = Sample_Label, y = 1, fill = nonchim_reads)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    scale_fill_gradientn(
+      colors = read_count_colors,
+      name = "Read Count",
+      labels = scales::comma,
+      breaks = c(0, max_reads),
+      limits = c(0, max_reads)
+    ) +
+    facet_wrap(~Panel, scales = "free_x", ncol = 3) +
+    theme_void() +
+    theme(
+      strip.text = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.key.width = unit(0.4, "cm"),
+      legend.key.height = unit(1.5, "cm"),
+      plot.margin = margin(0, 5, 5, 5)
+    ) +
+    scale_x_discrete(position = "bottom")
+
+  p_out <- (p_bar / p_heat) +
+    patchwork::plot_layout(heights = c(10, 1.5)) +
+    patchwork::plot_annotation(theme = theme(plot.margin = margin(5, 5, 5, 5)))
+
+  if (!is.null(output_file)) {
+    if (!dir.exists(dirname(output_file))) dir.create(dirname(output_file), recursive = TRUE)
+    png(output_file, width = width, height = height, units = "in", res = 300)
+    print(p_out)
+    dev.off()
+    cat("✓ Saved:", output_file, "\n")
+  }
+
+  return(p_out)
+}
+
+# ORIGINAL create_faceted_plot (unchanged)
+create_faceted_plot <- function(physeq,
+                                sample_filter = NULL,
+                                title = "Microbial Composition",
+                                output_file = NULL,
+                                top_n = 12,
+                                taxon_rank = "Family",
+                                width = 16,
+                                height = 11) {
+
+  if (!is.null(sample_filter) && "Method_Category" %in% colnames(sample_data(physeq))) {
+    physeq <- prune_samples(sample_data(physeq)$Method_Category %in% sample_filter, physeq)
+  }
+  if (nsamples(physeq) == 0) {
+    warning("No samples found after filtering")
+    return(NULL)
+  }
+
+  plot_df <- psmelt(physeq)
+  if ("sample_Sample" %in% colnames(plot_df) && !"Sample" %in% colnames(plot_df)) {
+    plot_df$Sample <- plot_df$sample_Sample
+  }
+
+  plot_df$Taxon <- plot_df[[taxon_rank]]
+  plot_df$Taxon[is.na(plot_df$Taxon) | plot_df$Taxon == ""] <- "Unclassified"
+
+  top_taxa <- plot_df %>%
+    dplyr::filter(Taxon != "Unclassified") %>%
+    dplyr::group_by(Taxon) %>%
+    dplyr::summarise(Total = sum(Abundance), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(Total)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::pull(Taxon)
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(Taxon_Display = dplyr::case_when(
+      Taxon == "Unclassified" ~ "Unclassified",
+      Taxon %in% top_taxa ~ Taxon,
+      TRUE ~ "Other"
+    ))
+
+  plot_df_agg <- plot_df %>%
+    dplyr::group_by(Sample, Taxon_Display) %>%
+    dplyr::summarise(
+      Abundance = sum(Abundance, na.rm = TRUE),
+      Full_Name_Display = dplyr::first(Full_Name_Display),
+      Method_Category   = dplyr::first(Method_Category),
+      nonchim_reads     = dplyr::first(nonchim_reads),
+      .groups = "drop"
+    )
+
+  plot_df_agg <- normalize_composition_by_sample(plot_df_agg, sample_col = "Sample", abundance_col = "Abundance")
+  
+  # Safety: ensure no NA/negative values before plotting
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::filter(!is.na(Abundance), Abundance >= 0) %>%
+    dplyr::mutate(Abundance = pmax(Abundance, 1e-10))
+
+  plot_df_agg$Depletion <- ifelse(
+    grepl("No host|No Host", plot_df_agg$Full_Name_Display, ignore.case = TRUE),
+    "No Host-Depletion",
+    "With Host-Depletion"
+  )
+
+  plot_df_agg$Sample_Label <- plot_df_agg$Full_Name_Display
+
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::arrange(Depletion, Sample) %>%
+    dplyr::group_by(Depletion) %>%
+    dplyr::mutate(Sample_Label = factor(Sample_Label, levels = unique(Sample_Label))) %>%
+    dplyr::ungroup()
+
+  taxa_order <- c("Other", "Unclassified", top_taxa)
+  plot_df_agg$Taxon_Display <- factor(plot_df_agg$Taxon_Display, levels = taxa_order)
+
+  cols <- create_color_palette(top_taxa)
+
+  p_bar <- ggplot(plot_df_agg, aes(x = Sample_Label, y = Abundance * 100, fill = Taxon_Display)) +
+    geom_bar(stat = "identity", color = "white", linewidth = 0.2) +
+    scale_fill_manual(values = cols, name = taxon_rank, drop = FALSE) +
+    facet_wrap(~Depletion, scales = "free_x", ncol = 2) +
+    labs(y = "Relative Abundance (%)", x = "", title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      strip.background = element_rect(fill = "grey90", color = "black"),
+      strip.text = element_text(face = "bold", size = 12),
+      panel.grid.major.y = element_line(color = "grey90"),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.margin = margin(5, 5, 0, 5)
+    ) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 100.1))
+
+  read_df <- plot_df_agg %>% dplyr::distinct(Sample_Label, Depletion, nonchim_reads)
+  max_reads <- max(read_df$nonchim_reads, na.rm = TRUE)
+
+  p_heat <- ggplot(read_df, aes(x = Sample_Label, y = 1, fill = nonchim_reads)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    scale_fill_gradientn(
+      colors = read_count_colors,
+      name = "Read Count",
+      labels = scales::comma,
+      breaks = c(0, max_reads),
+      limits = c(0, max_reads)
+    ) +
+    facet_wrap(~Depletion, scales = "free_x", ncol = 2) +
+    theme_void() +
+    theme(
+      strip.text = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.key.width = unit(0.4, "cm"),
+      legend.key.height = unit(1.5, "cm"),
+      plot.margin = margin(0, 5, 5, 5)
+    ) +
+    scale_x_discrete(position = "bottom")
+
+  p_out <- (p_bar / p_heat) +
+    patchwork::plot_layout(heights = c(10, 1.5)) +
+    patchwork::plot_annotation(theme = theme(plot.margin = margin(5, 5, 5, 5)))
+
+  if (!is.null(output_file)) {
+    if (!dir.exists(dirname(output_file))) dir.create(dirname(output_file), recursive = TRUE)
+    png(output_file, width = width, height = height, units = "in", res = 300)
+    print(p_out)
+    dev.off()
+    cat("✓ Saved:", output_file, "\n")
+  }
+
+  return(p_out)
+}
+
+# (Rest of the functions remain unchanged: create_simple_plot, create_enrichment_plot_4broths, create_heatmap)
+
+create_simple_plot <- function(physeq,
+                               sample_filter = NULL,
+                               title = "Microbial Composition",
+                               output_file = NULL,
+                               top_n = 12,
+                               taxon_rank = "Family",
+                               width = 14,
+                               height = 9) {
+
+  if (!is.null(sample_filter) && "Method_Category" %in% colnames(sample_data(physeq))) {
+    physeq <- prune_samples(sample_data(physeq)$Method_Category %in% sample_filter, physeq)
+  }
+  if (nsamples(physeq) == 0) {
+    warning("No samples found after filtering")
+    return(NULL)
+  }
+
+  plot_df <- psmelt(physeq)
+  if ("sample_Sample" %in% colnames(plot_df) && !"Sample" %in% colnames(plot_df)) {
+    plot_df$Sample <- plot_df$sample_Sample
+  }
+
+  plot_df$Taxon <- plot_df[[taxon_rank]]
+  plot_df$Taxon[is.na(plot_df$Taxon) | plot_df$Taxon == ""] <- "Unclassified"
+
+  top_taxa <- plot_df %>%
+    dplyr::filter(Taxon != "Unclassified") %>%
+    dplyr::group_by(Taxon) %>%
+    dplyr::summarise(Total = sum(Abundance), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(Total)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::pull(Taxon)
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(Taxon_Display = dplyr::case_when(
+      Taxon == "Unclassified" ~ "Unclassified",
+      Taxon %in% top_taxa ~ Taxon,
+      TRUE ~ "Other"
+    ))
+
+  plot_df_agg <- plot_df %>%
+    dplyr::group_by(Sample, Taxon_Display) %>%
+    dplyr::summarise(
+      Abundance = sum(Abundance, na.rm = TRUE),
+      Full_Name_Display = dplyr::first(Full_Name_Display),
+      Method_Category   = dplyr::first(Method_Category),
+      nonchim_reads     = dplyr::first(nonchim_reads),
+      .groups = "drop"
+    )
+
+  plot_df_agg <- normalize_composition_by_sample(plot_df_agg, sample_col = "Sample", abundance_col = "Abundance")
+  
+  # Safety: ensure no NA/negative values before plotting
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::filter(!is.na(Abundance), Abundance >= 0) %>%
+    dplyr::mutate(Abundance = pmax(Abundance, 1e-10))
+
+  plot_df_agg$Sample_Label <- plot_df_agg$Full_Name_Display
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::mutate(Sample_Label = factor(Sample_Label, levels = unique(Sample_Label)))
+
+  taxa_order <- c("Other", "Unclassified", top_taxa)
+  plot_df_agg$Taxon_Display <- factor(plot_df_agg$Taxon_Display, levels = taxa_order)
+
+  cols <- create_color_palette(top_taxa)
+
+  p_bar <- ggplot(plot_df_agg, aes(x = Sample_Label, y = Abundance * 100, fill = Taxon_Display)) +
+    geom_bar(stat = "identity", color = "white", linewidth = 0.2) +
+    scale_fill_manual(values = cols, name = taxon_rank, drop = FALSE) +
+    labs(y = "Relative Abundance (%)", x = "", title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid.major.y = element_line(color = "grey90"),
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.margin = margin(5, 5, 0, 5)
+    ) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 100.1))
+
+  read_df <- plot_df_agg %>% dplyr::distinct(Sample_Label, nonchim_reads)
+  max_reads <- max(read_df$nonchim_reads, na.rm = TRUE)
+
+  p_heat <- ggplot(read_df, aes(x = Sample_Label, y = 1, fill = nonchim_reads)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    scale_fill_gradientn(
+      colors = read_count_colors,
+      name = "Read Count",
+      labels = scales::comma,
+      breaks = c(0, max_reads),
+      limits = c(0, max_reads)
+    ) +
+    theme_void() +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.key.width = unit(0.4, "cm"),
+      legend.key.height = unit(1.5, "cm"),
+      plot.margin = margin(0, 5, 5, 5)
+    ) +
+    scale_x_discrete(position = "bottom")
+
+  p_out <- (p_bar / p_heat) +
+    patchwork::plot_layout(heights = c(10, 1.5)) +
+    patchwork::plot_annotation(theme = theme(plot.margin = margin(5, 5, 5, 5)))
+
+  if (!is.null(output_file)) {
+    if (!dir.exists(dirname(output_file))) dir.create(dirname(output_file), recursive = TRUE)
+    png(output_file, width = width, height = height, units = "in", res = 300)
+    print(p_out)
+    dev.off()
+    cat("✓ Saved:", output_file, "\n")
+  }
+
+  return(p_out)
+}
+
+create_enrichment_plot_4broths <- function(physeq,
+                                           sample_filter = "Enrichment Testing",
+                                           title = "Enrichment Testing - Temporal Dynamics by Broth",
+                                           output_file = NULL,
+                                           top_n = 12,
+                                           taxon_rank = "Family",
+                                           width = 16,
+                                           height = 12) {
+
+  if (!is.null(sample_filter) && "Method_Category" %in% colnames(sample_data(physeq))) {
+    physeq <- prune_samples(sample_data(physeq)$Method_Category %in% sample_filter, physeq)
+  }
+  if (nsamples(physeq) == 0) {
+    warning("No samples found after filtering")
+    return(NULL)
+  }
+
+  plot_df <- psmelt(physeq)
+  if ("sample_Sample" %in% colnames(plot_df) && !"Sample" %in% colnames(plot_df)) {
+    plot_df$Sample <- plot_df$sample_Sample
+  }
+
+  req <- c("Broth_Type", "Incubation_hr", "nonchim_reads", "Full_Name_Display")
+  miss <- req[!req %in% colnames(plot_df)]
+  if (length(miss) > 0) {
+    stop("Missing required metadata columns: ", paste(miss, collapse = ", "))
+  }
+
+  broth_levels <- c("RVS", "BPW", "BF Bolton", "BF Bolton + CAT")
+
+  plot_df <- plot_df %>%
+    dplyr::filter(!is.na(Broth_Type), !is.na(Incubation_hr)) %>%
+    dplyr::filter(Broth_Type %in% broth_levels) %>%
+    dplyr::mutate(Broth_Type = factor(Broth_Type, levels = broth_levels))
+
+  plot_df$Taxon <- plot_df[[taxon_rank]]
+  plot_df$Taxon[is.na(plot_df$Taxon) | plot_df$Taxon == ""] <- "Unclassified"
+
+  top_taxa <- plot_df %>%
+    dplyr::filter(Taxon != "Unclassified") %>%
+    dplyr::group_by(Taxon) %>%
+    dplyr::summarise(Total = sum(Abundance), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(Total)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::pull(Taxon)
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(Taxon_Display = dplyr::case_when(
+      Taxon == "Unclassified" ~ "Unclassified",
+      Taxon %in% top_taxa ~ Taxon,
+      TRUE ~ "Other"
+    ))
+
+  plot_df_agg <- plot_df %>%
+    dplyr::group_by(Broth_Type, Incubation_hr, Taxon_Display) %>%
+    dplyr::summarise(
+      Abundance = sum(Abundance),
+      .groups = "drop"
+    )
+
+  time_levels <- sort(unique(plot_df_agg$Incubation_hr))
+  taxa_order <- c("Other", "Unclassified", top_taxa)
+
+  plot_df_agg <- plot_df_agg %>%
+    dplyr::mutate(
+      Incubation_hr = factor(Incubation_hr, levels = time_levels),
+      Taxon_Display = factor(Taxon_Display, levels = taxa_order)
+    )
+
+  read_df <- plot_df %>%
+    dplyr::distinct(Sample, Broth_Type, Incubation_hr, nonchim_reads) %>%
+    dplyr::group_by(Broth_Type, Incubation_hr) %>%
+    dplyr::summarise(
+      nonchim_reads = median(nonchim_reads, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Incubation_hr = factor(Incubation_hr, levels = time_levels)
+    )
+
+  cols <- create_color_palette(top_taxa)
+
+  max_reads_all <- max(read_df$nonchim_reads, na.rm = TRUE)
+
+  create_single_broth_panel <- function(broth_name, show_y_axis = TRUE) {
+
+    broth_data <- plot_df_agg %>% dplyr::filter(Broth_Type == broth_name)
+    broth_reads <- read_df %>% dplyr::filter(Broth_Type == broth_name)
+
+    if (nrow(broth_data) == 0) return(NULL)
+
+    p_bar <- ggplot(broth_data, aes(x = Incubation_hr, y = Abundance * 100, fill = Taxon_Display)) +
+      geom_bar(stat = "identity", color = "white", linewidth = 0.2, position = "stack") +
+      scale_fill_manual(values = cols, name = taxon_rank, drop = FALSE) +
+      labs(x = NULL, y = if(show_y_axis) "Relative Abundance (%)" else NULL,
+           title = broth_name) +
+      theme_classic(base_size = 11) +
+      theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        panel.grid.major.y = element_line(color = "grey90"),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+        plot.margin = margin(5, 5, 0, 5)
+      ) +
+      scale_y_continuous(expand = c(0, 0), limits = c(0, 100.5))
+
+    if (!show_y_axis) {
+      p_bar <- p_bar + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+    }
+
+    p_heat <- ggplot(broth_reads, aes(x = Incubation_hr, y = 1, fill = nonchim_reads)) +
+      geom_tile(color = "white", linewidth = 0.5) +
+      scale_fill_gradientn(
+        colors = read_count_colors,
+        name = "Read Count",
+        labels = scales::comma,
+        breaks = c(0, max_reads_all),
+        limits = c(0, max_reads_all)
+      ) +
+      labs(x = "Incubation (h)") +
+      theme_void() +
+      theme(
+        axis.text.x = element_text(size = 9, margin = margin(t = 2)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 3)),
+        legend.position = "none",
+        plot.margin = margin(0, 5, 5, 5)
+      )
+
+    p_combined <- p_bar / p_heat + patchwork::plot_layout(heights = c(10, 1))
+
+    return(p_combined)
+  }
+
+  p_rvs <- create_single_broth_panel("RVS", show_y_axis = TRUE)
+  p_bpw <- create_single_broth_panel("BPW", show_y_axis = FALSE)
+  p_bolton <- create_single_broth_panel("BF Bolton", show_y_axis = TRUE)
+  p_bolton_cat <- create_single_broth_panel("BF Bolton + CAT", show_y_axis = FALSE)
+
+  p_legend_bar <- ggplot(plot_df_agg, aes(x = Incubation_hr, y = Abundance * 100, fill = Taxon_Display)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = cols, name = taxon_rank, drop = FALSE) +
+    theme(legend.position = "right",
+          legend.title = element_text(face = "bold"),
+          legend.key.size = unit(0.4, "cm"))
+
+  legend_bar <- cowplot::get_legend(p_legend_bar)
+
+  p_legend_heat <- ggplot(read_df, aes(x = Incubation_hr, y = 1, fill = nonchim_reads)) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colors = read_count_colors,
+      name = "Read Count",
+      labels = scales::comma,
+      breaks = c(0, max_reads_all),
+      limits = c(0, max_reads_all)
+    ) +
+    theme(legend.position = "right",
+          legend.direction = "vertical",
+          legend.key.width = unit(0.4, "cm"),
+          legend.key.height = unit(2, "cm"),
+          legend.title = element_text(face = "bold"))
+
+  legend_heat <- cowplot::get_legend(p_legend_heat)
+
+  panels <- list(p_rvs, p_bpw, p_bolton, p_bolton_cat)
+  panels <- panels[!sapply(panels, is.null)]
+
+  if (length(panels) == 4) {
+    top_row <- (p_rvs | p_bpw)
+    bottom_row <- (p_bolton | p_bolton_cat)
+    main_plot <- top_row / bottom_row
+  } else {
+    main_plot <- patchwork::wrap_plots(panels, ncol = 2)
+  }
+
+  title_grob <- cowplot::ggdraw() +
+    cowplot::draw_label(title, fontface = "bold", size = 14, hjust = 0.5)
+
+  legends_combined <- cowplot::plot_grid(
+    legend_bar,
+    legend_heat,
+    ncol = 1,
+    rel_heights = c(1, 0.5),
+    align = "v"
+  )
+
+  p_out <- cowplot::plot_grid(
+    title_grob,
+    cowplot::plot_grid(
+      main_plot,
+      legends_combined,
+      ncol = 2,
+      rel_widths = c(4, 1)
+    ),
+    ncol = 1,
+    rel_heights = c(0.05, 1)
+  )
+
+  if (!is.null(output_file)) {
+    if (!dir.exists(dirname(output_file))) dir.create(dirname(output_file), recursive = TRUE)
+    png(output_file, width = width, height = height, units = "in", res = 300)
+    print(p_out)
+    dev.off()
+    cat("✓ Saved:", output_file, "\n")
+  }
+
+  return(p_out)
+}
+
+create_heatmap <- function(physeq,
+                           sample_filter = NULL,
+                           title = "Microbial Diversity Heatmap",
+                           output_file = NULL,
+                           top_n = 12,
+                           taxon_rank = "Family",
+                           width = 20,
+                           height = 12) {
+
+  if (!is.null(sample_filter) && "Method_Category" %in% colnames(sample_data(physeq))) {
+    physeq <- prune_samples(sample_data(physeq)$Method_Category %in% sample_filter, physeq)
+  }
+  if (nsamples(physeq) == 0) {
+    warning("No samples found after filtering")
+    return(NULL)
+  }
+
+  otu_mat <- as.matrix(otu_table(physeq))
+  if (!taxa_are_rows(physeq)) otu_mat <- t(otu_mat)
+
+  tax_df <- as.data.frame(tax_table(physeq))
+  stopifnot(taxon_rank %in% colnames(tax_df))
+
+  rownames(otu_mat) <- tax_df[[taxon_rank]]
+  rownames(otu_mat)[is.na(rownames(otu_mat)) | rownames(otu_mat) == ""] <- "Unclassified"
+  otu_mat <- rowsum(otu_mat, rownames(otu_mat))
+
+  top_taxa <- names(sort(rowSums(otu_mat), decreasing = TRUE)[1:top_n])
+  otu_mat_top <- otu_mat[top_taxa, , drop = FALSE] * 100
+
+  meta_df <- data.frame(sample_data(physeq), check.names = FALSE, stringsAsFactors = FALSE)
+  valid_samples <- rownames(meta_df)[!is.na(meta_df$Method_Category) & !is.na(meta_df$nonchim_reads)]
+
+  if (length(valid_samples) == 0) {
+    warning("No samples with complete metadata found")
+    return(NULL)
+  }
+
+  meta_df <- meta_df[valid_samples, , drop = FALSE]
+  otu_mat_top <- otu_mat_top[, valid_samples, drop = FALSE]
+
+  sample_order <- rownames(meta_df)[order(meta_df$Method_Category)]
+  otu_mat_top <- otu_mat_top[, sample_order, drop = FALSE]
+  meta_df <- meta_df[sample_order, , drop = FALSE]
+
+  display_names <- if ("Full_Name_Display" %in% colnames(meta_df) && !all(is.na(meta_df$Full_Name_Display))) {
+    meta_df$Full_Name_Display
+  } else {
+    rownames(meta_df)
+  }
+  display_names <- ifelse(nchar(display_names) > 50, paste0(substr(display_names, 1, 47), "..."), display_names)
+  if (any(duplicated(display_names))) display_names <- make.unique(display_names, sep = "_")
+
+  colnames(otu_mat_top) <- display_names
+
+  annotation_col <- data.frame(
+    Category = meta_df$Method_Category,
+    Reads = meta_df$nonchim_reads,
+    row.names = display_names,
+    stringsAsFactors = FALSE
+  )
+
+  ann_colors <- list(
+    Category = category_colors[names(category_colors) %in% unique(annotation_col$Category)],
+    Reads = colorRampPalette(c("white", "#fee391", "#fec44f", "#fe9929", "#d95f0e", "#993404"))(100)
+  )
+
+  if (!is.null(output_file)) {
+    if (!dir.exists(dirname(output_file))) dir.create(dirname(output_file), recursive = TRUE)
+    png(output_file, width = width, height = height, units = "in", res = 300)
+  }
+
+  tryCatch({
+    pheatmap(
+      otu_mat_top,
+      color = colorRampPalette(abundance_heatmap_colors)(100),
+      cluster_rows = FALSE,
+      cluster_cols = FALSE,
+      annotation_col = annotation_col,
+      annotation_colors = ann_colors,
+      show_colnames = TRUE,
+      show_rownames = TRUE,
+      fontsize = 9,
+      fontsize_col = 7,
+      fontsize_row = 10,
+      angle_col = 90,
+      main = title,
+      border_color = "white",
+      cellwidth = 12,
+      cellheight = 12
+    )
+  }, error = function(e) {
+    cat("Error creating heatmap:", e$message, "\n")
+  })
+
+  if (!is.null(output_file)) {
+    dev.off()
+    cat("✓ Saved:", output_file, "\n")
+  }
+
+  invisible(NULL)
+}
+
+cat("✓ All plotting functions defined\n")
+```
+
+---
+
+# Diagnostic Check (optional - can comment out after verification)
+
+```{r diagnostic-check-composition}
+# Check if ps_family_rel samples sum to 1
+family_sums <- sample_sums(ps_family_rel)
+cat("Family-level sample sums (should all be 1.0):\n")
+print(summary(family_sums))
+cat("\nSamples NOT summing to 1.0:\n")
+print(family_sums[abs(family_sums - 1) > 0.01])
+
+# Check if ps_genus_rel samples sum to 1
+genus_sums <- sample_sums(ps_genus_rel)
+cat("\nGenus-level sample sums (should all be 1.0):\n")
+print(summary(genus_sums))
+cat("\nSamples NOT summing to 1.0:\n")
+print(genus_sums[abs(genus_sums - 1) > 0.01])
+```
+
+```{r debug-one-plot, eval=FALSE}
+# DEBUG: Use this to diagnose individual plot issues
+test_ps <- prune_samples(sample_data(ps_family_rel)$Method_Category == "Host-DNA depletion", ps_family_rel)
+
+plot_df <- psmelt(test_ps)
+if ("sample_Sample" %in% colnames(plot_df) && !"Sample" %in% colnames(plot_df)) {
+  plot_df$Sample <- plot_df$sample_Sample
+}
+
+plot_df$Taxon <- plot_df$Family
+plot_df$Taxon[is.na(plot_df$Taxon) | plot_df$Taxon == ""] <- "Unclassified"
+
+top_taxa <- plot_df %>%
+  dplyr::filter(Taxon != "Unclassified") %>%
+  dplyr::group_by(Taxon) %>%
+  dplyr::summarise(Total = sum(Abundance), .groups = "drop") %>%
+  dplyr::arrange(desc(Total)) %>%
+  dplyr::slice_head(n = 12) %>%
+  dplyr::pull(Taxon)
+
+plot_df <- plot_df %>%
+  dplyr::mutate(Taxon_Display = dplyr::case_when(
+    Taxon == "Unclassified" ~ "Unclassified",
+    Taxon %in% top_taxa ~ Taxon,
+    TRUE ~ "Other"
+  ))
+
+plot_df_agg <- plot_df %>%
+  dplyr::group_by(Sample, Taxon_Display) %>%
+  dplyr::summarise(
+    Abundance = sum(Abundance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("BEFORE normalization:\n")
+totals_before <- plot_df_agg %>%
+  dplyr::group_by(Sample) %>%
+  dplyr::summarise(total = sum(Abundance), .groups = "drop")
+print(totals_before)
+
+plot_df_agg <- normalize_composition_by_sample(plot_df_agg, "Sample", "Abundance")
+
+cat("\nAFTER normalization:\n")
+totals_after <- plot_df_agg %>%
+  dplyr::group_by(Sample) %>%
+  dplyr::summarise(total = sum(Abundance), .groups = "drop")
+print(totals_after)
+
+cat("\nAny totals NOT 1.0?\n")
+print(totals_after %>% filter(abs(total - 1) > 0.001))
+
+cat("\nTaxa present:\n")
+print(table(plot_df_agg$Taxon_Display))
+```
+
+---
+
+# Create Visualizations
+
+## Host-DNA Depletion Comparison
+
+```{r host-dna-depletion-family, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_family_rel,
+  sample_filter = "Host-DNA depletion",
+  title = "Effect of Host-DNA Depletion on Bacterial Composition\n(Top 12 Families)",
+  output_file = "final_plots/01_host_dna_depletion_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+```{r host-dna-depletion-genus, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_genus_rel,
+  sample_filter = "Host-DNA depletion",
+  title = "Effect of Host-DNA Depletion on Bacterial Composition\n(Top 12 Genera)",
+  output_file = "final_plots/02_host_dna_depletion_genus.png",
+  taxon_rank = "Genus",
+  top_n = 12
+)
+```
+
+## Filtration Testing
+
+```{r filtration-family, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_family_rel,
+  sample_filter = "Filtration testing for Host-DNA depletion",
+  title = "Effect of Filtering and host-DNA Depletion on Bacterial Composition\n(Top 12 Families)",
+  output_file = "final_plots/03_filtration_testing_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+```{r filtration-genus, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_genus_rel,
+  sample_filter = "Filtration testing for Host-DNA depletion",
+  title = "Effect of Filtering and host-DNA Depletion on Bacterial Composition\n(Top 12 Genera)",
+  output_file = "final_plots/04_filtration_testing_genus.png",
+  taxon_rank = "Genus",
+  top_n = 12
+)
+```
+
+## Enrichment Testing + Host-DNA Depletion
+
+```{r enriched-depletion-family, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_family_rel,
+  sample_filter = "Host-DNA depletion - enriched samples",
+  title = "Effect of Host-DNA Depletion on Enriched Samples\n(Top 12 Families)",
+  output_file = "final_plots/05_enriched_depletion_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+```{r enriched-depletion-genus, fig.width=16, fig.height=11}
+create_faceted_plot(
+  ps_genus_rel,
+  sample_filter = "Host-DNA depletion - enriched samples",
+  title = "Effect of Host-DNA Depletion on Enriched Samples\n(Top 12 Genera)",
+  output_file = "final_plots/06_enriched_depletion_genus.png",
+  taxon_rank = "Genus",
+  top_n = 12
+)
+```
+
+## Enrichment Testing - Temporal Dynamics
+
+```{r enrichment-temporal-family, fig.width=16, fig.height=12}
+create_enrichment_plot_4broths(
+  ps_family_rel,
+  sample_filter = "Enrichment Testing",
+  title = "Enrichment Testing - Temporal Dynamics by Broth (Top 12 Families)",
+  output_file = "final_plots/07_enrichment_temporal_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+```{r enrichment-temporal-genus, fig.width=16, fig.height=12}
+create_enrichment_plot_4broths(
+  ps_genus_rel,
+  sample_filter = "Enrichment Testing",
+  title = "Enrichment Testing - Temporal Dynamics by Broth (Top 12 Genera)",
+  output_file = "final_plots/08_enrichment_temporal_genus.png",
+  taxon_rank = "Genus",
+  top_n = 12
+)
+```
+
+## DNA Extraction Kit Comparison
+
+```{r extraction-kits, fig.width=12, fig.height=11}
+create_simple_plot(
+  ps_family_rel,
+  sample_filter = "DNA extraction kit testing",
+  title = "DNA Extraction Kit Comparison\n(Top 12 Families)",
+  output_file = "final_plots/09_extraction_kit_family.png",
+  taxon_rank = "Family",
+  top_n = 12,
+  width = 12,
+  height = 11
+)
+```
+
+## Heatmaps
+
+```{r heatmap-all-family, fig.width=18, fig.height=10}
+create_heatmap(
+  ps_family_rel,
+  sample_filter = NULL,
+  title = "All Samples - Microbial Diversity (Top 12 Families)",
+  output_file = "final_plots/10_all_samples_heatmap_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+```{r heatmap-all-genus, fig.width=18, fig.height=10}
+create_heatmap(
+  ps_genus_rel,
+  sample_filter = NULL,
+  title = "All Samples - Microbial Diversity (Top 12 Genera)",
+  output_file = "final_plots/11_all_samples_heatmap_genus.png",
+  taxon_rank = "Genus",
+  top_n = 12
+)
+```
+
+```{r heatmap-depletion, fig.width=18, fig.height=10}
+create_heatmap(
+  ps_family_rel,
+  sample_filter = c("Host-DNA depletion", "Filtration testing for Host-DNA depletion", 
+                    "Host-DNA depletion - enriched samples"),
+  title = "Host-DNA Depletion Methods Comparison (Top 12 Families)",
+  output_file = "final_plots/12_host_depletion_heatmap_family.png",
+  taxon_rank = "Family",
+  top_n = 12
+)
+```
+
+---
+
+# Read Tracking and Distribution
+
+## Read Tracking
+
+```{r read-tracking, fig.width=14, fig.height=8}
+track_long <- data.frame(
+  Sample = sample_names(ps),
+  input = sample_data(ps)$input,
+  filtered = sample_data(ps)$filtered,
+  merged = sample_data(ps)$merged,
+  nonchim = sample_data(ps)$nonchim,
+  Method_Category = sample_data(ps)$Method_Category
+) %>%
+  pivot_longer(cols = c(input, filtered, merged, nonchim),
+               names_to = "Stage", values_to = "Reads") %>%
+  mutate(Stage = factor(Stage, levels = c("input", "filtered", "merged", "nonchim")))
+
+p_tracking <- ggplot(track_long, aes(x = Stage, y = Reads, color = Method_Category, group = Sample)) +
+  geom_line(alpha = 0.3) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_y_continuous(labels = comma) +
+  scale_color_manual(values = category_colors) +
+  labs(x = "Pipeline Stage", y = "Read Count",
+       title = "Read Tracking Through DADA2 Pipeline",
+       color = "Sample Category") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+if (!dir.exists("final_plots")) dir.create("final_plots", recursive = TRUE)
+png("final_plots/13_read_tracking.png", width = 14, height = 8, units = "in", res = 300)
+print(p_tracking)
+dev.off()
+
+print(p_tracking)
+```
+
+## Read Distribution
+
+```{r read-distribution, fig.width=12, fig.height=8}
+track_summary <- data.frame(
+  Sample = sample_names(ps),
+  nonchim = sample_data(ps)$nonchim,
+  Method_Category = sample_data(ps)$Method_Category
+)
+
+p_distribution <- ggplot(track_summary, aes(x = Method_Category, y = nonchim)) +
+  geom_boxplot(aes(fill = Method_Category), alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = category_colors) +
+  labs(x = "", y = "Non-chimeric Reads",
+       title = "Final Read Count Distribution by Category") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+png("final_plots/14_read_distribution.png", width = 12, height = 8, units = "in", res = 300)
+print(p_distribution)
+dev.off()
+
+print(p_distribution)
+```
+
+---
+
+# Summary Statistics
+
+```{r summary-statistics}
+summary_stats <- data.frame(
+  Sample = sample_names(ps),
+  input = sample_data(ps)$input,
+  filtered = sample_data(ps)$filtered,
+  merged = sample_data(ps)$merged,
+  nonchim = sample_data(ps)$nonchim,
+  Method_Category = sample_data(ps)$Method_Category,
+  DNA_Conc = sample_data(ps)$DNA_Conc
+) %>%
+  group_by(Method_Category) %>%
+  summarise(
+    N_Samples = n(),
+    Mean_Input = round(mean(input, na.rm = TRUE), 0),
+    SD_Input = round(sd(input, na.rm = TRUE), 0),
+    Mean_Filtered = round(mean(filtered, na.rm = TRUE), 0),
+    Mean_Merged = round(mean(merged, na.rm = TRUE), 0),
+    Mean_Nonchim = round(mean(nonchim, na.rm = TRUE), 0),
+    SD_Nonchim = round(sd(nonchim, na.rm = TRUE), 0),
+    Min_Nonchim = min(nonchim, na.rm = TRUE),
+    Max_Nonchim = max(nonchim, na.rm = TRUE),
+    Pct_Retained = round(mean(nonchim / input * 100, na.rm = TRUE), 1),
+    Mean_DNA_Conc = round(mean(DNA_Conc, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  summary_stats,
+  caption = "Summary Statistics by Sample Category",
+  format.args = list(big.mark = ",")
+)
+
+write.csv(summary_stats, "final_plots/read_count_summary.csv", row.names = FALSE)
+cat("✓ Saved summary statistics\n")
+```
+
+---
+
+# Save R Objects
+
+```{r save-objects}
+saveRDS(ps, "final_plots/ps_with_sample_data.rds")
+saveRDS(ps_family_rel, "final_plots/ps_family_rel.rds")
+saveRDS(ps_genus_rel, "final_plots/ps_genus_rel.rds")
+saveRDS(track_df, "final_plots/track_df.rds")
+
+cat("✓ Saved R objects\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+# Files Created
+
+```{r list-files}
+png_files <- list.files("final_plots", pattern = "\\.png$", full.names = FALSE)
+csv_files <- list.files("final_plots", pattern = "\\.csv$", full.names = FALSE)
+rds_files <- list.files("final_plots", pattern = "\\.rds$", full.names = FALSE)
+
+cat("PNG Visualizations (", length(png_files), "):\n", sep = "")
+for (file in png_files) cat("  •", file, "\n")
+
+cat("\nData Files (", length(csv_files), "):\n", sep = "")
+for (file in csv_files) cat("  •", file, "\n")
+
+cat("\nR Objects (", length(rds_files), "):\n", sep = "")
+for (file in rds_files) cat("  •", file, "\n")
+```
